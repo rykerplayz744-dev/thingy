@@ -1,0 +1,10 @@
+{
+  "name": "SquadTalk — Background Voice Hangout",
+  "description": "Simple, fast voice hangout web app built for Vercel Hobby plan with background audio keep-alive so friends can talk while playing games or using other apps.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
