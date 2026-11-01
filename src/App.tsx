@@ -31,6 +31,7 @@ import {
 } from './shared/roomStore';
 import { SquadAudioEngine, CalloutSoundId } from './lib/audioEngine';
 import { PipCallOverlay } from './lib/pipOverlay';
+import { RealtimeMesh } from './lib/realtimeMesh';
 
 const AVATAR_OPTIONS = [
   { id: 'headset', label: 'Headset' },
@@ -74,25 +75,31 @@ function AvatarIcon({ avatarId, className = 'w-5 h-5' }: { avatarId: string; cla
 }
 
 export default function App() {
-  // Persistent User Identity (no passwords or sign-up wall)
+  // Unique Peer ID per tab instance so opening multiple tabs lets you test and interact with yourself
   const [peerId] = useState<string>(() => {
-    const saved = localStorage.getItem('squadtalk_peer_id');
-    if (saved) return saved;
-    const next = `peer-${Math.random().toString(36).slice(2, 10)}`;
-    localStorage.setItem('squadtalk_peer_id', next);
+    return `peer-${Math.random().toString(36).slice(2, 10)}`;
+  });
+
+  const [joinedAt] = useState<number>(() => Date.now());
+
+  const [myName, setMyName] = useState<string>(() => {
+    const savedSession = sessionStorage.getItem('squadtalk_tab_name');
+    if (savedSession) return savedSession;
+    const next = `Friend${Math.floor(10 + Math.random() * 89)}`;
+    sessionStorage.setItem('squadtalk_tab_name', next);
     return next;
   });
 
-  const [myName, setMyName] = useState<string>(() => {
-    return localStorage.getItem('squadtalk_name') || `Friend${Math.floor(10 + Math.random() * 89)}`;
-  });
-
   const [myAvatar, setMyAvatar] = useState<string>(() => {
-    return localStorage.getItem('squadtalk_avatar') || 'headset';
+    return sessionStorage.getItem('squadtalk_tab_avatar') || 'headset';
   });
 
   const [myColor, setMyColor] = useState<string>(() => {
-    return localStorage.getItem('squadtalk_color') || 'indigo';
+    const saved = sessionStorage.getItem('squadtalk_tab_color');
+    if (saved) return saved;
+    const randomColor = COLOR_OPTIONS[Math.floor(Math.random() * COLOR_OPTIONS.length)].id;
+    sessionStorage.setItem('squadtalk_tab_color', randomColor);
+    return randomColor;
   });
 
   // Call & Audio States
@@ -111,29 +118,49 @@ export default function App() {
   const [inBackground, setInBackground] = useState<boolean>(false);
   const [bgShieldActive, setBgShieldActive] = useState<boolean>(false);
   const [pipActive, setPipActive] = useState<boolean>(false);
-  const [transportMode, setTransportMode] = useState<'ws+http' | 'vercel-http'>('vercel-http');
+  const [connStatus, setConnStatus] = useState<{
+    cloudConnected: boolean;
+    brokerCount: number;
+    localWsConnected: boolean;
+  }>({
+    cloudConnected: false,
+    brokerCount: 0,
+    localWsConnected: false,
+  });
   const [chunksSentCount, setChunksSentCount] = useState<number>(0);
   const [chunksReceivedCount, setChunksReceivedCount] = useState<number>(0);
   const [micError, setMicError] = useState<string | null>(null);
 
   const [participants, setParticipants] = useState<Participant[]>([]);
-  const [messages, setMessages] = useState<RoomMessage[]>([]);
+  const [messages, setMessages] = useState<RoomMessage[]>([
+    {
+      id: 'welcome-main',
+      roomId: SINGLE_ROOM_ID,
+      senderId: 'system',
+      senderName: 'Hangout',
+      senderColor: 'indigo',
+      senderAvatar: 'headset',
+      type: 'text',
+      text: 'Welcome! Open another tab or share the link with friends—everyone connects automatically to this room.',
+      timestamp: Date.now(),
+    },
+  ]);
 
   const [chatText, setChatText] = useState<string>('');
   const [copiedInvite, setCopiedInvite] = useState<boolean>(false);
   const [showProfileEditor, setShowProfileEditor] = useState<boolean>(false);
   const [activeSection, setActiveSection] = useState<'room' | 'feed' | 'guide' | 'vercel'>('room');
 
-  // Refs for callbacks inside intervals / audio processor
+  // Refs
   const audioEngineRef = useRef<SquadAudioEngine | null>(null);
   const pipOverlayRef = useRef<PipCallOverlay | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const latestSeqRef = useRef<number>(0);
+  const meshRef = useRef<RealtimeMesh | null>(null);
   const playedChunkIdsRef = useRef<Set<string>>(new Set());
-  const playedMessageIdsRef = useRef<Set<string>>(new Set());
+  const playedMessageIdsRef = useRef<Set<string>>(new Set(['welcome-main']));
 
   const stateRef = useRef({
     peerId,
+    joinedAt,
     myName,
     myAvatar,
     myColor,
@@ -147,11 +174,13 @@ export default function App() {
     echoTestEnabled,
     isSpeakerMuted,
     participants,
+    messages,
   });
 
   useEffect(() => {
     stateRef.current = {
       peerId,
+      joinedAt,
       myName,
       myAvatar,
       myColor,
@@ -165,9 +194,11 @@ export default function App() {
       echoTestEnabled,
       isSpeakerMuted,
       participants,
+      messages,
     };
   }, [
     peerId,
+    joinedAt,
     myName,
     myAvatar,
     myColor,
@@ -181,14 +212,16 @@ export default function App() {
     echoTestEnabled,
     isSpeakerMuted,
     participants,
+    messages,
   ]);
 
-  // Save profile preferences
+  // Save per-tab profile preferences and broadcast immediately when changed
   useEffect(() => {
-    localStorage.setItem('squadtalk_name', myName);
-    localStorage.setItem('squadtalk_avatar', myAvatar);
-    localStorage.setItem('squadtalk_color', myColor);
-  }, [myName, myAvatar, myColor]);
+    sessionStorage.setItem('squadtalk_tab_name', myName);
+    sessionStorage.setItem('squadtalk_tab_avatar', myAvatar);
+    sessionStorage.setItem('squadtalk_tab_color', myColor);
+    meshRef.current?.broadcastMyPresence();
+  }, [myName, myAvatar, myColor, isJoined, micMode, inBackground]);
 
   // Instantiate Audio Engine & PiP helper once
   useEffect(() => {
@@ -204,9 +237,6 @@ export default function App() {
   const handleIncomingPacket = useCallback((packet: VoiceChunkPacket) => {
     if (playedChunkIdsRef.current.has(packet.id)) return;
     playedChunkIdsRef.current.add(packet.id);
-    if (packet.seq > latestSeqRef.current) {
-      latestSeqRef.current = packet.seq;
-    }
 
     const st = stateRef.current;
     if (packet.senderId === st.peerId) {
@@ -225,7 +255,70 @@ export default function App() {
     }
   }, []);
 
-  // Transmit 1-second voice chunk over WebSocket + HTTP fallback
+  // Handle incoming room message
+  const handleIncomingMessage = useCallback((msg: RoomMessage, isLiveEvent: boolean) => {
+    setMessages((prev) => {
+      if (prev.some((m) => m.id === msg.id)) return prev;
+      const next = [...prev, msg].sort((a, b) => a.timestamp - b.timestamp);
+      return next.slice(-60);
+    });
+
+    if (
+      isLiveEvent &&
+      msg.type === 'callout' &&
+      msg.soundId &&
+      !playedMessageIdsRef.current.has(msg.id)
+    ) {
+      playedMessageIdsRef.current.add(msg.id);
+      if (msg.senderId !== stateRef.current.peerId && !stateRef.current.isSpeakerMuted) {
+        audioEngineRef.current?.playCalloutSound(msg.soundId as CalloutSoundId);
+      }
+    } else {
+      playedMessageIdsRef.current.add(msg.id);
+    }
+  }, []);
+
+  // Start RealtimeMesh (Cloud WebSocket MQTT + Multi-Tab BroadcastChannel + Server API)
+  useEffect(() => {
+    const mesh = new RealtimeMesh({
+      myPeerId: peerId,
+      getMyParticipant: () => {
+        const st = stateRef.current;
+        const speakingNow =
+          st.isJoined &&
+          ((st.micMode === 'open' && st.myAudioLevel >= st.vadThreshold) ||
+            (st.micMode === 'ptt' && st.isPttPressed) ||
+            st.isRecordingNote);
+        return {
+          id: st.peerId,
+          name: st.myName,
+          avatarId: st.myAvatar,
+          color: st.myColor,
+          micMode: st.isJoined ? st.micMode : 'muted',
+          isSpeaking: speakingNow,
+          audioLevel: st.isJoined ? st.myAudioLevel : 0,
+          inBackground: st.inBackground,
+          joinedAt: st.joinedAt,
+          lastSeenAt: Date.now(),
+        };
+      },
+      getRecentMessages: () => stateRef.current.messages,
+      onParticipantsChanged: (list) => setParticipants(list),
+      onVoiceChunk: (packet) => handleIncomingPacket(packet),
+      onRoomMessage: (msg, isLive) => handleIncomingMessage(msg, isLive),
+      onConnectionStatus: (status) => setConnStatus(status),
+    });
+
+    meshRef.current = mesh;
+    mesh.start();
+
+    return () => {
+      mesh.destroy();
+      meshRef.current = null;
+    };
+  }, [peerId, handleIncomingPacket, handleIncomingMessage]);
+
+  // Transmit 1-second voice chunk over RealtimeMesh
   const transmitVoiceChunk = useCallback(
     async (chunk: {
       audioDataUrl: string;
@@ -235,7 +328,8 @@ export default function App() {
       label?: string;
     }) => {
       const st = stateRef.current;
-      const chunkId = `${st.peerId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const now = Date.now();
+      const chunkId = `${st.peerId}-${now}-${Math.random().toString(36).slice(2, 6)}`;
       setChunksSentCount((c) => c + 1);
 
       if (st.echoTestEnabled && !st.isSpeakerMuted) {
@@ -246,7 +340,8 @@ export default function App() {
         }, 1400);
       }
 
-      const payload = {
+      const packet: VoiceChunkPacket = {
+        seq: now,
         id: chunkId,
         roomId: SINGLE_ROOM_ID,
         senderId: st.peerId,
@@ -256,46 +351,32 @@ export default function App() {
         audioDataUrl: chunk.audioDataUrl,
         durationMs: chunk.durationMs,
         peakLevel: chunk.peakLevel,
+        timestamp: now,
         saveToFeed: Boolean(chunk.saveToFeed),
         label: chunk.label,
-        echoTest: st.echoTestEnabled,
       };
 
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: 'voice:chunk',
-            roomId: SINGLE_ROOM_ID,
-            chunk: payload,
-          })
-        );
+      let feedMessage: RoomMessage | undefined;
+      if (chunk.saveToFeed) {
+        feedMessage = {
+          id: `vc-${chunkId}`,
+          roomId: SINGLE_ROOM_ID,
+          senderId: st.peerId,
+          senderName: st.myName,
+          senderColor: st.myColor,
+          senderAvatar: st.myAvatar,
+          type: 'voice_clip',
+          text: chunk.label || 'Voice transmission',
+          audioDataUrl: chunk.audioDataUrl,
+          durationMs: chunk.durationMs,
+          timestamp: now,
+        };
+        handleIncomingMessage(feedMessage, false);
       }
 
-      try {
-        const res = await fetch('/api/room', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            action: 'voice_chunk',
-            roomId: SINGLE_ROOM_ID,
-            chunk: payload,
-          }),
-        });
-        if (res.ok) {
-          const data = await res.json();
-          if (data.feedMessage) {
-            setMessages((prev) =>
-              prev.some((m) => m.id === data.feedMessage.id)
-                ? prev
-                : [...prev, data.feedMessage]
-            );
-          }
-        }
-      } catch {
-        // Ignore transient network hiccup
-      }
+      meshRef.current?.sendVoiceChunk(packet, feedMessage, st.echoTestEnabled);
     },
-    []
+    [handleIncomingMessage]
   );
 
   // Join & Start Background Audio + Microphone
@@ -341,25 +422,14 @@ export default function App() {
     }
 
     setIsJoined(true);
+    window.setTimeout(() => meshRef.current?.broadcastMyPresence(), 50);
   }, [transmitVoiceChunk]);
 
   const leaveHangout = useCallback(async () => {
     setIsJoined(false);
     setMyAudioLevel(0);
     audioEngineRef.current?.stopMicrophone();
-    try {
-      await fetch('/api/room', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'leave',
-          roomId: SINGLE_ROOM_ID,
-          peerId: stateRef.current.peerId,
-        }),
-      });
-    } catch {
-      // Ignore
-    }
+    window.setTimeout(() => meshRef.current?.broadcastMyPresence(), 50);
   }, []);
 
   // Track Document Visibility (when user pulls up another app over the browser)
@@ -417,167 +487,6 @@ export default function App() {
     };
   }, [transmitVoiceChunk]);
 
-  // WebSocket + Vercel Hobby HTTP Polling Synchronization Loop
-  useEffect(() => {
-    let isCancelled = false;
-
-    try {
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        if (isCancelled) return;
-        setTransportMode('ws+http');
-        const st = stateRef.current;
-        ws.send(
-          JSON.stringify({
-            type: 'room:join',
-            roomId: SINGLE_ROOM_ID,
-            participant: {
-              id: st.peerId,
-              name: st.myName,
-              avatarId: st.myAvatar,
-              color: st.myColor,
-              micMode: st.isJoined ? st.micMode : 'muted',
-              isSpeaking:
-                st.isJoined &&
-                ((st.micMode === 'open' && st.myAudioLevel >= st.vadThreshold) ||
-                  (st.micMode === 'ptt' && st.isPttPressed)),
-              audioLevel: st.isJoined ? st.myAudioLevel : 0,
-              inBackground: st.inBackground,
-            },
-          })
-        );
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.type === 'room:init') {
-            setParticipants(data.participants || []);
-            setMessages(data.messages || []);
-            if (typeof data.latestSeq === 'number') {
-              latestSeqRef.current = data.latestSeq;
-            }
-          } else if (data.type === 'participants:update') {
-            setParticipants(data.participants || []);
-          } else if (data.type === 'voice:chunk' && data.packet) {
-            handleIncomingPacket(data.packet);
-            if (data.feedMessage) {
-              setMessages((prev) =>
-                prev.some((m) => m.id === data.feedMessage.id)
-                  ? prev
-                  : [...prev, data.feedMessage]
-              );
-            }
-          } else if (data.type === 'room:message' && data.message) {
-            const msg: RoomMessage = data.message;
-            setMessages((prev) =>
-              prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]
-            );
-            if (
-              msg.type === 'callout' &&
-              msg.soundId &&
-              !playedMessageIdsRef.current.has(msg.id)
-            ) {
-              playedMessageIdsRef.current.add(msg.id);
-              if (msg.senderId !== stateRef.current.peerId && !stateRef.current.isSpeakerMuted) {
-                audioEngineRef.current?.playCalloutSound(msg.soundId as CalloutSoundId);
-              }
-            }
-          }
-        } catch {
-          // Ignore parse error
-        }
-      };
-
-      ws.onclose = () => {
-        if (!isCancelled) {
-          setTransportMode('vercel-http');
-        }
-      };
-    } catch {
-      setTransportMode('vercel-http');
-    }
-
-    const syncTick = async () => {
-      if (isCancelled) return;
-      const st = stateRef.current;
-      const speakingNow =
-        st.isJoined &&
-        ((st.micMode === 'open' && st.myAudioLevel >= st.vadThreshold) ||
-          (st.micMode === 'ptt' && st.isPttPressed));
-
-      try {
-        const res = await fetch('/api/room', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            action: 'heartbeat',
-            roomId: SINGLE_ROOM_ID,
-            sinceSeq: latestSeqRef.current,
-            participant: {
-              id: st.peerId,
-              name: st.myName,
-              avatarId: st.myAvatar,
-              color: st.myColor,
-              micMode: st.isJoined ? st.micMode : 'muted',
-              isSpeaking: speakingNow,
-              audioLevel: st.isJoined ? st.myAudioLevel : 0,
-              inBackground: st.inBackground,
-            },
-          }),
-        });
-
-        if (res.ok) {
-          const snapshot = await res.json();
-          if (Array.isArray(snapshot.participants)) {
-            setParticipants(snapshot.participants);
-          }
-          if (Array.isArray(snapshot.voiceChunks)) {
-            for (const pkt of snapshot.voiceChunks) {
-              handleIncomingPacket(pkt);
-            }
-          }
-          if (Array.isArray(snapshot.messages)) {
-            setMessages((prev) => {
-              const prevIds = new Set(prev.map((m) => m.id));
-              for (const m of snapshot.messages as RoomMessage[]) {
-                if (
-                  m.type === 'callout' &&
-                  m.soundId &&
-                  !playedMessageIdsRef.current.has(m.id) &&
-                  prev.length > 0 &&
-                  !prevIds.has(m.id)
-                ) {
-                  playedMessageIdsRef.current.add(m.id);
-                  if (m.senderId !== st.peerId && !st.isSpeakerMuted) {
-                    audioEngineRef.current?.playCalloutSound(m.soundId as CalloutSoundId);
-                  }
-                } else {
-                  playedMessageIdsRef.current.add(m.id);
-                }
-              }
-              return snapshot.messages;
-            });
-          }
-        }
-      } catch {
-        // Offline or reconnecting
-      }
-    };
-
-    syncTick();
-    const interval = window.setInterval(syncTick, 850);
-
-    return () => {
-      isCancelled = true;
-      clearInterval(interval);
-      wsRef.current?.close();
-    };
-  }, [handleIncomingPacket]);
-
   // Send quick callout + play sound
   const sendCallout = async (preset: { id: CalloutSoundId; label: string }) => {
     await audioEngineRef.current?.initAudioContext();
@@ -585,9 +494,10 @@ export default function App() {
       audioEngineRef.current?.playCalloutSound(preset.id);
     }
 
-    const msgId = `msg-${peerId}-${Date.now()}`;
+    const now = Date.now();
+    const msgId = `msg-${peerId}-${now}`;
     playedMessageIdsRef.current.add(msgId);
-    const payload: Omit<RoomMessage, 'timestamp'> = {
+    const message: RoomMessage = {
       id: msgId,
       roomId: SINGLE_ROOM_ID,
       senderId: peerId,
@@ -597,35 +507,11 @@ export default function App() {
       type: 'callout',
       text: preset.label,
       soundId: preset.id,
+      timestamp: now,
     };
 
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'room:message',
-          roomId: SINGLE_ROOM_ID,
-          message: payload,
-        })
-      );
-    }
-
-    const res = await fetch('/api/room', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'message',
-        roomId: SINGLE_ROOM_ID,
-        message: payload,
-      }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      if (data.message) {
-        setMessages((prev) =>
-          prev.some((m) => m.id === data.message.id) ? prev : [...prev, data.message]
-        );
-      }
-    }
+    handleIncomingMessage(message, false);
+    meshRef.current?.sendRoomMessage(message);
   };
 
   // Send text message
@@ -635,8 +521,10 @@ export default function App() {
     if (!trimmed) return;
     setChatText('');
 
-    const msgId = `msg-${peerId}-${Date.now()}`;
-    const payload: Omit<RoomMessage, 'timestamp'> = {
+    const now = Date.now();
+    const msgId = `msg-${peerId}-${now}`;
+    playedMessageIdsRef.current.add(msgId);
+    const message: RoomMessage = {
       id: msgId,
       roomId: SINGLE_ROOM_ID,
       senderId: peerId,
@@ -645,35 +533,11 @@ export default function App() {
       senderAvatar: myAvatar,
       type: 'text',
       text: trimmed,
+      timestamp: now,
     };
 
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'room:message',
-          roomId: SINGLE_ROOM_ID,
-          message: payload,
-        })
-      );
-    }
-
-    const res = await fetch('/api/room', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'message',
-        roomId: SINGLE_ROOM_ID,
-        message: payload,
-      }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      if (data.message) {
-        setMessages((prev) =>
-          prev.some((m) => m.id === data.message.id) ? prev : [...prev, data.message]
-        );
-      }
-    }
+    handleIncomingMessage(message, false);
+    meshRef.current?.sendRoomMessage(message);
   };
 
   const handleCopyInvite = () => {
@@ -795,19 +659,21 @@ export default function App() {
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div className="space-y-1">
               <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
-                <span className="tabular-nums font-medium text-slate-800">
-                  {participants.length} {participants.length === 1 ? 'Friend' : 'Friends'} Online
+                <span className="tabular-nums font-semibold text-slate-900">
+                  {participants.length} {participants.length === 1 ? 'Person' : 'People'} in Room
                 </span>
                 <span aria-hidden="true">·</span>
-                <span>
-                  {transportMode === 'ws+http'
-                    ? 'Live Stream + 1s Relay Active'
-                    : 'Vercel 1s Chunk Relay Active'}
+                <span className="text-emerald-700 font-medium">
+                  {connStatus.brokerCount > 0
+                    ? `Global WebSocket Mesh Connected (${connStatus.brokerCount} Relays)`
+                    : connStatus.localWsConnected
+                      ? 'Live WebSocket Connected'
+                      : 'Multi-Tab & HTTP Relay Active'}
                 </span>
                 {bgShieldActive && (
                   <>
                     <span aria-hidden="true">·</span>
-                    <span className="text-emerald-700 font-medium">
+                    <span className="text-indigo-700 font-medium">
                       Background Keep-Alive On
                     </span>
                   </>
@@ -815,7 +681,7 @@ export default function App() {
               </div>
               <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900 font-display">
                 {isJoined
-                  ? 'You’re in the Hangout — Switch to any game or app and keep talking'
+                  ? 'You’re Live — Switch to any game or open another tab to test'
                   : 'Tap Join Hangout to talk with your friends'}
               </h1>
             </div>
@@ -967,10 +833,10 @@ export default function App() {
             <div className="flex items-center justify-between">
               <div>
                 <h2 className="text-xl font-bold text-slate-900 font-display">
-                  Built for Vercel Hobby Plan (Free Tier)
+                  How Multiplayer Works on Vercel Hobby Plan (Zero Setup)
                 </h2>
                 <p className="text-sm text-slate-600 mt-1">
-                  Uses a 1-second compressed WAV chunk relay at <code className="font-mono text-xs bg-slate-100 px-1.5 py-0.5 rounded">/api/room</code> so you don&apos;t need paid WebSocket servers or external databases.
+                  Connects all tabs and devices automatically over encrypted Cloud WebSocket MQTT relays + Multi-Tab BroadcastChannel so Vercel doesn&apos;t need a database.
                 </p>
               </div>
               <button
@@ -985,23 +851,21 @@ export default function App() {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div className="p-5 bg-slate-50 rounded-xl space-y-3">
                 <h3 className="text-base font-bold text-slate-900">
-                  Why Normal Voice Apps Fail on Vercel Hobby Plan
+                  Why Stateless Vercel Functions Alone Aren&apos;t Enough
                 </h3>
                 <p className="text-sm text-slate-600 leading-relaxed">
-                  Vercel&apos;s free Hobby plan terminates long-lived WebSocket connections on Serverless Functions. SquadTalk solves this by capturing 1-second 11kHz mono WAV voice chunks (~22 KB/sec) whenever you speak and relaying them through <code className="font-mono text-xs">/api/room</code> HTTP requests every second, while also supporting instant WebSockets when hosted on Node.
+                  On Vercel&apos;s Hobby plan, serverless functions spin up separate isolated instances and don&apos;t share live WebSocket state across users. SquadTalk solves this by connecting browsers directly to redundant public WebSocket MQTT relays (<code className="font-mono text-xs">wss://broker.emqx.io</code> and <code className="font-mono text-xs">wss://broker.hivemq.com</code>) plus <code className="font-mono text-xs">BroadcastChannel</code> for instant multi-tab testing.
                 </p>
               </div>
 
               <div className="p-5 bg-slate-50 rounded-xl space-y-3">
                 <h3 className="text-base font-bold text-slate-900">
-                  How to Deploy to Your Vercel Hobby Account
+                  Test Across Two Tabs Right Now
                 </h3>
                 <ol className="text-sm text-slate-600 space-y-2 list-decimal list-inside">
-                  <li>Push this project to a GitHub repository.</li>
-                  <li>Import the repository in Vercel on the free <strong>Hobby</strong> plan.</li>
-                  <li>
-                    <code className="font-mono text-xs">vercel.json</code> and <code className="font-mono text-xs">/api/room.ts</code> are already pre-configured—just click <strong>Deploy</strong> and share the link with your friends!
-                  </li>
+                  <li>Open this URL in two separate browser tabs (or on your phone and computer).</li>
+                  <li>Both tabs immediately appear under <strong>Friends Online</strong> with their own username.</li>
+                  <li>Tap <strong>Join Hangout</strong> or click any <strong>Quick Game Callout</strong> in one tab and hear it in the other tab!</li>
                 </ol>
               </div>
             </div>
@@ -1360,91 +1224,80 @@ export default function App() {
                   </h2>
                 </div>
                 <span className="text-xs text-slate-500 tabular-nums">
-                  {participants.length} online right now
+                  {participants.length} {participants.length === 1 ? 'person' : 'people'} connected
                 </span>
               </div>
 
-              {participants.length === 0 ? (
-                <div className="p-8 text-center bg-slate-50 rounded-2xl space-y-3">
-                  <p className="text-sm font-medium text-slate-700">
-                    Waiting for friends to open the site...
-                  </p>
-                  <p className="text-xs text-slate-500 max-w-sm mx-auto">
-                    Anyone who opens this link automatically lands right here with you.
-                  </p>
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-                  {participants.map((p) => {
-                    const isMe = p.id === peerId;
-                    const colorMeta = getColorMeta(p.color);
-                    const speaking = isMe
-                      ? isCurrentlyTransmitting
-                      : p.isSpeaking || p.audioLevel > 14;
-                    const level = isMe ? myAudioLevel : p.audioLevel;
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                {participants.map((p) => {
+                  const isMe = p.id === peerId;
+                  const colorMeta = getColorMeta(p.color);
+                  const speaking = isMe
+                    ? isCurrentlyTransmitting
+                    : p.isSpeaking || p.audioLevel > 14;
+                  const level = isMe ? myAudioLevel : p.audioLevel;
 
-                    return (
-                      <div
-                        key={p.id}
-                        className={`p-4 rounded-2xl border transition-all ${
-                          speaking
-                            ? 'bg-emerald-50/60 border-emerald-400 shadow-xs'
-                            : 'bg-slate-50/70 border-slate-200'
-                        }`}
-                      >
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="flex items-center gap-3 min-w-0">
-                            <div
-                              className={`w-12 h-12 rounded-2xl ${colorMeta.bg} text-white flex items-center justify-center shrink-0 ${
-                                speaking ? 'ring-4 ring-emerald-400/50' : ''
-                              }`}
-                            >
-                              <AvatarIcon avatarId={p.avatarId} className="w-6 h-6" />
+                  return (
+                    <div
+                      key={p.id}
+                      className={`p-4 rounded-2xl border transition-all ${
+                        speaking
+                          ? 'bg-emerald-50/60 border-emerald-400 shadow-xs'
+                          : 'bg-slate-50/70 border-slate-200'
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div
+                            className={`w-12 h-12 rounded-2xl ${colorMeta.bg} text-white flex items-center justify-center shrink-0 ${
+                              speaking ? 'ring-4 ring-emerald-400/50' : ''
+                            }`}
+                          >
+                            <AvatarIcon avatarId={p.avatarId} className="w-6 h-6" />
+                          </div>
+                          <div className="min-w-0">
+                            <div className="text-sm font-bold text-slate-900 truncate">
+                              {p.name} {isMe ? '(You)' : ''}
                             </div>
-                            <div className="min-w-0">
-                              <div className="text-sm font-bold text-slate-900 truncate">
-                                {p.name} {isMe ? '(You)' : ''}
-                              </div>
-                              <div className="text-xs text-slate-500 flex items-center gap-1.5 mt-0.5">
-                                <span>
-                                  {p.micMode === 'muted'
-                                    ? 'Muted'
-                                    : speaking
-                                      ? 'Talking Now'
-                                      : p.micMode === 'open'
-                                        ? 'Open Mic'
-                                        : 'Push-to-Talk'}
-                                </span>
-                                <span aria-hidden="true">·</span>
-                                <span>
-                                  {p.inBackground ? 'Playing in Other App' : 'In App'}
-                                </span>
-                              </div>
+                            <div className="text-xs text-slate-500 flex items-center gap-1.5 mt-0.5">
+                              <span>
+                                {p.micMode === 'muted'
+                                  ? 'Listening (Muted)'
+                                  : speaking
+                                    ? 'Talking Now'
+                                    : p.micMode === 'open'
+                                      ? 'Open Mic'
+                                      : 'Push-to-Talk'}
+                              </span>
+                              <span aria-hidden="true">·</span>
+                              <span>
+                                {p.inBackground ? 'In Background App' : 'In App'}
+                              </span>
                             </div>
                           </div>
-
-                          <span className="font-mono text-xs font-semibold text-slate-600 tabular-nums shrink-0">
-                            {p.micMode === 'muted' ? 'MUTE' : `${level}%`}
-                          </span>
                         </div>
 
-                        <div className="mt-3 h-1.5 w-full bg-slate-200/80 rounded-full overflow-hidden">
-                          <div
-                            style={{
-                              width: `${
-                                p.micMode === 'muted' ? 0 : Math.min(100, Math.max(4, level))
-                              }%`,
-                            }}
-                            className={`h-full transition-all duration-150 ${
-                              speaking ? 'bg-emerald-500' : 'bg-indigo-500'
-                            }`}
-                          />
-                        </div>
+                        <span className="font-mono text-xs font-semibold text-slate-600 tabular-nums shrink-0">
+                          {p.micMode === 'muted' ? 'MUTE' : `${level}%`}
+                        </span>
                       </div>
-                    );
-                  })}
-                </div>
-              )}
+
+                      <div className="mt-3 h-1.5 w-full bg-slate-200/80 rounded-full overflow-hidden">
+                        <div
+                          style={{
+                            width: `${
+                              p.micMode === 'muted' ? 0 : Math.min(100, Math.max(4, level))
+                            }%`,
+                          }}
+                          className={`h-full transition-all duration-150 ${
+                            speaking ? 'bg-emerald-500' : 'bg-indigo-500'
+                          }`}
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           </div>
 
@@ -1634,7 +1487,7 @@ export default function App() {
           <div className="flex items-center gap-2">
             <ShieldCheck className="w-4 h-4 text-emerald-600" />
             <span>
-              SquadTalk — Single-Room Background Voice Hangout (Vercel Hobby Plan Ready)
+              SquadTalk — Global WebSocket Mesh + Multi-Tab Voice Hangout (Vercel Hobby Ready)
             </span>
           </div>
           <div className="flex items-center gap-4">

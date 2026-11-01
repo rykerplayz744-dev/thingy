@@ -1,82 +1,15 @@
-// Self-contained Vercel Hobby Plan Serverless Function (/api/room)
-// Shares globalThis.__SQUADTALK_SINGLE_ROOM__ with server.ts when running in Node
-
-type MicMode = 'open' | 'ptt' | 'muted';
+// Plain JavaScript Vercel Hobby Plan Serverless Function (/api/room.js)
+// Zero TypeScript compilation issues on Vercel + shares state with server.ts
 
 const SINGLE_ROOM_ID = 'MAIN';
-const PARTICIPANT_TTL_MS = 28_000;
+const PARTICIPANT_TTL_MS = 18_000;
 const CHUNK_RETENTION_MS = 45_000;
 const MAX_MESSAGES_PER_ROOM = 60;
 const MAX_CHUNKS_PER_ROOM = 80;
 
-interface Participant {
-  id: string;
-  name: string;
-  avatarId: string;
-  color: string;
-  micMode: MicMode;
-  isSpeaking: boolean;
-  audioLevel: number;
-  inBackground: boolean;
-  joinedAt: number;
-  lastSeenAt: number;
-}
+const globalStore = globalThis;
 
-interface VoiceChunkPacket {
-  seq: number;
-  id: string;
-  roomId: string;
-  senderId: string;
-  senderName: string;
-  senderColor: string;
-  senderAvatar: string;
-  audioDataUrl: string;
-  durationMs: number;
-  peakLevel: number;
-  timestamp: number;
-  saveToFeed?: boolean;
-  label?: string;
-}
-
-interface RoomMessage {
-  id: string;
-  roomId: string;
-  senderId: string;
-  senderName: string;
-  senderColor: string;
-  senderAvatar: string;
-  type: 'text' | 'callout' | 'voice_clip';
-  text: string;
-  soundId?: string;
-  audioDataUrl?: string;
-  durationMs?: number;
-  timestamp: number;
-}
-
-interface WebRTCSignalPacket {
-  id: string;
-  roomId: string;
-  fromPeerId: string;
-  toPeerId: string;
-  signalType: 'offer' | 'answer' | 'ice';
-  payload: unknown;
-  timestamp: number;
-}
-
-interface RoomState {
-  roomId: string;
-  seqCounter: number;
-  participants: Map<string, Participant>;
-  voiceChunks: VoiceChunkPacket[];
-  messages: RoomMessage[];
-  signals: WebRTCSignalPacket[];
-}
-
-const globalStore = globalThis as unknown as {
-  __SQUADTALK_SINGLE_ROOM__?: RoomState;
-};
-
-function getRoom(): RoomState {
+function getRoom() {
   if (!globalStore.__SQUADTALK_SINGLE_ROOM__) {
     globalStore.__SQUADTALK_SINGLE_ROOM__ = {
       roomId: SINGLE_ROOM_ID,
@@ -116,7 +49,7 @@ function getRoom(): RoomState {
   return room;
 }
 
-function getSnapshot(peerId: string, sinceSeq = 0) {
+function getSnapshot(peerId, sinceSeq = 0) {
   const room = getRoom();
   const participants = Array.from(room.participants.values()).sort(
     (a, b) => a.joinedAt - b.joinedAt
@@ -137,7 +70,7 @@ function getSnapshot(peerId: string, sinceSeq = 0) {
   };
 }
 
-export default function handler(req: any, res: any) {
+export default function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
 
   if (req.method === 'GET') {
@@ -204,7 +137,7 @@ export default function handler(req: any, res: any) {
         return res.status(400).json({ error: 'Invalid voice chunk payload' });
       }
       let packet = room.voiceChunks.find((c) => c.id === String(chunk.id));
-      let feedMessage: RoomMessage | undefined;
+      let feedMessage;
 
       if (!packet) {
         packet = {
