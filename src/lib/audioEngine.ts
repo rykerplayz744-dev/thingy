@@ -1,6 +1,7 @@
-// Universal Background Voice & 1-Second Chunk Audio Engine
+// Universal Background Voice & Ultra-Low-Latency Micro-Chunk Audio Engine
 
 export type CalloutSoundId = 'hop_on' | 'wait_up' | 'gg' | 'watch_out' | 'ready' | 'laugh';
+export type LatencyPresetMs = 250 | 450 | 950;
 
 export interface CapturedChunkResult {
   audioDataUrl: string;
@@ -17,34 +18,35 @@ function writeString(view: DataView, offset: number, str: string) {
 export function encodeWavFromFloat32(
   samples: Float32Array,
   sourceSampleRate: number,
-  targetSampleRate = 11025
+  targetSampleRate = 8000
 ): string {
-  // Downsample to targetSampleRate for compact 1-second packets (~22KB/sec)
   const ratio = sourceSampleRate / targetSampleRate;
   const outLength = Math.max(1, Math.floor(samples.length / ratio));
-  const buffer = new ArrayBuffer(44 + outLength * 2);
+  // 8-bit unsigned PCM WAV (1 byte per sample = only ~2KB per 0.25s frame!)
+  const buffer = new ArrayBuffer(44 + outLength);
   const view = new DataView(buffer);
 
   writeString(view, 0, 'RIFF');
-  view.setUint32(4, 36 + outLength * 2, true);
+  view.setUint32(4, 36 + outLength, true);
   writeString(view, 8, 'WAVE');
   writeString(view, 12, 'fmt ');
-  view.setUint32(16, 16, true); // PCM chunk size
-  view.setUint16(20, 1, true); // PCM format
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
   view.setUint16(22, 1, true); // Mono
   view.setUint32(24, targetSampleRate, true);
-  view.setUint32(28, targetSampleRate * 2, true); // Byte rate
-  view.setUint16(32, 2, true); // Block align
-  view.setUint16(34, 16, true); // 16-bit
+  view.setUint32(28, targetSampleRate, true); // 1 byte per sample
+  view.setUint16(32, 1, true); // Block align 1
+  view.setUint16(34, 8, true); // 8-bit PCM
   writeString(view, 36, 'data');
-  view.setUint32(40, outLength * 2, true);
+  view.setUint32(40, outLength, true);
 
   let offset = 44;
   for (let i = 0; i < outLength; i++) {
     const srcIdx = Math.min(samples.length - 1, Math.floor(i * ratio));
     const s = Math.max(-1, Math.min(1, samples[srcIdx]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-    offset += 2;
+    // 8-bit WAV is unsigned 0..255 with 128 as center silence
+    view.setUint8(offset, Math.round((s + 1) * 127.5));
+    offset += 1;
   }
 
   const bytes = new Uint8Array(buffer);
@@ -88,13 +90,16 @@ export class SquadAudioEngine {
   private lastChunkEmitTime = 0;
   private nextPlayTime = 0;
 
+  public chunkIntervalMs: LatencyPresetMs = 250; // Default to ultra-fast 250ms micro-frames!
   public isBackgroundKeepAliveActive = false;
   public speakerVolume = 1.0;
 
   public async initAudioContext(): Promise<AudioContext> {
     if (!this.ctx) {
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      this.ctx = new AudioCtx();
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      this.ctx = new AudioCtx({ latencyHint: 'interactive' });
     }
     if (this.ctx.state === 'suspended') {
       await this.ctx.resume();
@@ -107,6 +112,10 @@ export class SquadAudioEngine {
     return this.ctx;
   }
 
+  public setChunkIntervalMs(ms: LatencyPresetMs) {
+    this.chunkIntervalMs = ms;
+  }
+
   public setSpeakerVolume(vol: number) {
     this.speakerVolume = Math.max(0, Math.min(1.5, vol));
     if (this.masterGain && this.ctx) {
@@ -117,11 +126,6 @@ export class SquadAudioEngine {
     }
   }
 
-  /**
-   * Starts the continuous background audio carrier + OS MediaSession + WebLocks
-   * so pulling up another app (Roblox, Minecraft, etc.) over the browser does not
-   * suspend microphone capture or incoming voice playback.
-   */
   public async enableBackgroundKeepAlive(
     roomId: string,
     onToggleMute?: () => void
@@ -135,7 +139,6 @@ export class SquadAudioEngine {
           this.masterGain.connect(this.keepAliveDest);
         }
 
-        // Sub-audible continuous carrier so mobile OS media daemon never sleeps the stream
         const osc = ctx.createOscillator();
         const carrierGain = ctx.createGain();
         osc.type = 'sine';
@@ -155,15 +158,12 @@ export class SquadAudioEngine {
         this.keepAliveAudioEl = audio;
       }
 
-      await this.keepAliveAudioEl.play().catch(() => {
-        // Handled on next interaction if blocked
-      });
+      await this.keepAliveAudioEl.play().catch(() => {});
 
-      // Configure OS Lock Screen & Control Center MediaSession
       if ('mediaSession' in navigator) {
         navigator.mediaSession.metadata = new MediaMetadata({
-          title: `SquadTalk — Room ${roomId}`,
-          artist: 'Background Voice Active (1s Relay)',
+          title: `SquadTalk — ${roomId}`,
+          artist: 'Background Voice Active (Low-Latency Stream)',
           album: 'Switch apps freely — voice stays connected',
         });
         navigator.mediaSession.playbackState = 'playing';
@@ -182,19 +182,17 @@ export class SquadAudioEngine {
         }
       }
 
-      // Request Web Lock to prevent background tab freezing in Chromium browsers
       if ('locks' in navigator && (navigator as any).locks?.request) {
         (navigator as any).locks
           .request('squadtalk_background_voice_lock', () => new Promise(() => {}))
           .catch(() => {});
       }
 
-      // Request Screen WakeLock when visible
       if ('wakeLock' in navigator && (navigator as any).wakeLock?.request) {
         try {
           this.wakeLock = await (navigator as any).wakeLock.request('screen');
         } catch {
-          // WakeLock optional
+          // Optional
         }
       }
 
@@ -214,10 +212,6 @@ export class SquadAudioEngine {
     }
   }
 
-  /**
-   * Starts microphone capture and invokes `onOneSecondChunk` every ~1000ms
-   * whenever shouldTransmit() returns true.
-   */
   public async startMicrophone(options: {
     shouldTransmit: (peakLevel: number) => boolean;
     onLevelChange: (level: number, freqBands: number[]) => void;
@@ -237,17 +231,16 @@ export class SquadAudioEngine {
       });
     }
 
-    // Clean up any existing nodes before re-wiring
-    this. processor?.disconnect();
+    this.processor?.disconnect();
     this.micSource?.disconnect();
 
     this.micSource = ctx.createMediaStreamSource(this.micStream);
     this.analyser = ctx.createAnalyser();
     this.analyser.fftSize = 128;
-    this.analyser.smoothingTimeConstant = 0.65;
+    this.analyser.smoothingTimeConstant = 0.6;
 
-    // 4096 buffer @ 44.1kHz is ~92ms per callback
-    this.processor = ctx.createScriptProcessor(4096, 1, 1);
+    // 2048 buffer @ 44.1kHz is ~46ms callback latency (twice as responsive as 4096)
+    this.processor = ctx.createScriptProcessor(2048, 1, 1);
     const freqData = new Uint8Array(this.analyser.frequencyBinCount);
 
     this.pcmChunks = [];
@@ -258,7 +251,6 @@ export class SquadAudioEngine {
     this.processor.onaudioprocess = (event) => {
       const input = event.inputBuffer.getChannelData(0);
 
-      // Compute RMS / Peak for this frame
       let sumSquares = 0;
       let framePeak = 0;
       for (let i = 0; i < input.length; i++) {
@@ -283,7 +275,6 @@ export class SquadAudioEngine {
         options.onLevelChange(normalizedLevel, bands);
       }
 
-      // Copy samples into current 1-second buffer
       const copy = new Float32Array(input.length);
       copy.set(input);
       this.pcmChunks.push(copy);
@@ -292,8 +283,8 @@ export class SquadAudioEngine {
       const now = performance.now();
       const elapsedMs = now - this.lastChunkEmitTime;
 
-      // Emit every ~1000ms (1 second delay window)
-      if (elapsedMs >= 980 && this.pcmTotalSamples > 0) {
+      // Emit at the configured low-latency window (default 250ms!)
+      if (elapsedMs >= this.chunkIntervalMs && this.pcmTotalSamples > 0) {
         const peak = this.currentWindowPeak;
         const transmit = options.shouldTransmit(peak);
 
@@ -319,8 +310,6 @@ export class SquadAudioEngine {
       }
     };
 
-    // ScriptProcessor requires connection to destination to fire in all browsers;
-    // connect through a 0-gain mute node so the user doesn't hear immediate raw self-feedback.
     const silentMonitor = ctx.createGain();
     silentMonitor.gain.value = 0;
 
@@ -333,7 +322,7 @@ export class SquadAudioEngine {
   }
 
   public FlushCurrentBuffer(): CapturedChunkResult | null {
-    if (!this.ctx || this.pcmTotalSamples < this.ctx.sampleRate * 0.2) {
+    if (!this.ctx || this.pcmTotalSamples < this.ctx.sampleRate * 0.12) {
       this.pcmChunks = [];
       this.pcmTotalSamples = 0;
       this.currentWindowPeak = 0;
@@ -361,10 +350,6 @@ export class SquadAudioEngine {
     };
   }
 
-  /**
-   * Plays an incoming 1-second voice chunk seamlessly through the already-unlocked
-   * AudioContext + Background MediaStream so it works even when another app is in front!
-   */
   public async playIncomingVoiceChunk(audioDataUrl: string): Promise<void> {
     try {
       const ctx = await this.initAudioContext();
@@ -376,7 +361,6 @@ export class SquadAudioEngine {
       const source = ctx.createBufferSource();
       source.buffer = audioBuffer;
 
-      // Boost voice clarity slightly with a gentle compressor/gain
       const voiceGain = ctx.createGain();
       voiceGain.gain.value = 1.15;
 
@@ -387,26 +371,25 @@ export class SquadAudioEngine {
         voiceGain.connect(ctx.destination);
       }
 
-      // Queue chunks smoothly back-to-back without overlapping stutter
       const now = ctx.currentTime;
-      const startAt = Math.max(now + 0.02, this.nextPlayTime);
+      // Prevent queue buildup if behind by more than 0.6s (keeps live stream real-time!)
+      if (this.nextPlayTime > now + 0.6) {
+        this.nextPlayTime = now + 0.01;
+      }
+      const startAt = Math.max(now + 0.008, this.nextPlayTime);
       source.start(startAt);
       this.nextPlayTime = startAt + audioBuffer.duration;
     } catch {
-      // Fallback to standard HTMLAudioElement if decodeAudioData fails
       try {
         const fallbackAudio = new Audio(audioDataUrl);
         fallbackAudio.volume = Math.min(1, this.speakerVolume);
         await fallbackAudio.play();
       } catch {
-        // Ignore playback error
+        // Ignore
       }
     }
   }
 
-  /**
-   * Plays a synthesized callout sound effect through the background audio stream
-   */
   public async playCalloutSound(soundId: CalloutSoundId): Promise<void> {
     try {
       const ctx = await this.initAudioContext();
@@ -425,9 +408,9 @@ export class SquadAudioEngine {
 
       if (soundId === 'hop_on') {
         osc.type = 'triangle';
-        osc.frequency.setValueAtTime(523.25, now); // C5
-        osc.frequency.setValueAtTime(659.25, now + 0.1); // E5
-        osc.frequency.setValueAtTime(783.99, now + 0.2); // G5
+        osc.frequency.setValueAtTime(523.25, now);
+        osc.frequency.setValueAtTime(659.25, now + 0.1);
+        osc.frequency.setValueAtTime(783.99, now + 0.2);
         gain.gain.setValueAtTime(0.25, now);
         gain.gain.exponentialRampToValueAtTime(0.001, now + 0.45);
         osc.start(now);
@@ -477,7 +460,7 @@ export class SquadAudioEngine {
         osc.stop(now + 0.28);
       }
     } catch {
-      // Ignore audio synth error
+      // Ignore
     }
   }
 

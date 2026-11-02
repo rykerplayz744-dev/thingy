@@ -7,6 +7,7 @@ import {
 } from '../shared/roomStore';
 
 // Dedicated topic scoped to this app so all tabs and devices on Vercel connect to the same room
+// 100% of voice upload/download flows through these external brokers, using 0 bytes of Vercel Hobby bandwidth!
 const MESH_TOPIC = 'squadtalk/rykerplayz744-thingy-main-room-v2/events';
 
 const PUBLIC_WSS_BROKERS = [
@@ -68,8 +69,6 @@ export class RealtimeMesh {
   private broadcastChannel: BroadcastChannel | null = null;
   private localWs: WebSocket | null = null;
   private heartbeatTimer: number | null = null;
-  private apiPollTimer: number | null = null;
-  private latestApiSeq = 0;
   private destroyed = false;
 
   constructor(options: {
@@ -99,7 +98,7 @@ export class RealtimeMesh {
     this.peers.set(me.id, me);
     this.emitParticipantsList();
 
-    // 1. Same-Browser Multi-Tab BroadcastChannel (instant <2ms between tabs)
+    // 1. Same-Browser Multi-Tab BroadcastChannel (0 network bandwidth, <2ms latency)
     if (typeof BroadcastChannel !== 'undefined') {
       try {
         this.broadcastChannel = new BroadcastChannel('squadtalk_room_mesh_v2');
@@ -109,11 +108,11 @@ export class RealtimeMesh {
           }
         };
       } catch {
-        // Ignore if unsupported
+        // Ignore
       }
     }
 
-    // 2. Cloud WebSocket MQTT Pub/Sub Brokers (works on Vercel Hobby Plan globally with zero backend setup)
+    // 2. External Cloud WebSocket MQTT Brokers (0 Vercel bandwidth or Serverless Function usage!)
     for (const url of PUBLIC_WSS_BROKERS) {
       try {
         const client = mqtt.connect(url, {
@@ -151,81 +150,76 @@ export class RealtimeMesh {
 
         this.mqttClients.push(client);
       } catch {
-        // Ignore broker init failure
+        // Ignore
       }
     }
 
-    // 3. Local WebSocket (/ws) when running on Node server (AI Studio / self-hosted)
-    try {
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
-      this.localWs = ws;
+    // 3. Local WebSocket (/ws) ONLY when not on vercel.app (so Vercel never gets WebSocket 404 requests)
+    const isVercelHost = window.location.hostname.endsWith('.vercel.app');
+    if (!isVercelHost) {
+      try {
+        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+        this.localWs = ws;
 
-      ws.onopen = () => {
-        if (this.destroyed) return;
-        this.updateStatus();
-        ws.send(
-          JSON.stringify({
-            type: 'room:join',
-            roomId: SINGLE_ROOM_ID,
-            participant: this.getMyParticipant(),
-          })
-        );
-      };
+        ws.onopen = () => {
+          if (this.destroyed) return;
+          this.updateStatus();
+          ws.send(
+            JSON.stringify({
+              type: 'room:join',
+              roomId: SINGLE_ROOM_ID,
+              participant: this.getMyParticipant(),
+            })
+          );
+        };
 
-      ws.onmessage = (ev) => {
-        if (this.destroyed) return;
-        try {
-          const data = JSON.parse(ev.data);
-          if (data.type === 'room:init' || data.type === 'participants:update') {
-            if (Array.isArray(data.participants)) {
-              this.mergeServerParticipants(data.participants);
-            }
-            if (Array.isArray(data.messages)) {
-              for (const m of data.messages as RoomMessage[]) {
-                this.onRoomMessage(m, false);
+        ws.onmessage = (ev) => {
+          if (this.destroyed) return;
+          try {
+            const data = JSON.parse(ev.data);
+            if (data.type === 'room:init' || data.type === 'participants:update') {
+              if (Array.isArray(data.participants)) {
+                this.mergeServerParticipants(data.participants);
               }
+              if (Array.isArray(data.messages)) {
+                for (const m of data.messages as RoomMessage[]) {
+                  this.onRoomMessage(m, false);
+                }
+              }
+            } else if (data.type === 'voice:chunk' && data.packet) {
+              this.onVoiceChunk(data.packet);
+              if (data.feedMessage) {
+                this.onRoomMessage(data.feedMessage, true);
+              }
+            } else if (data.type === 'room:message' && data.message) {
+              this.onRoomMessage(data.message, true);
             }
-          } else if (data.type === 'voice:chunk' && data.packet) {
-            this.onVoiceChunk(data.packet);
-            if (data.feedMessage) {
-              this.onRoomMessage(data.feedMessage, true);
-            }
-          } else if (data.type === 'room:message' && data.message) {
-            this.onRoomMessage(data.message, true);
+          } catch {
+            // Ignore
           }
-        } catch {
-          // Ignore
-        }
-      };
+        };
 
-      ws.onclose = () => this.updateStatus();
-    } catch {
-      // Ignore if /ws not available on Vercel static host
+        ws.onclose = () => this.updateStatus();
+      } catch {
+        // Ignore
+      }
     }
 
-    // Broadcast initial hello right away for BroadcastChannel tabs
+    // Broadcast initial hello right away
     this.publishMeshPacket({
       type: 'peer:hello',
       eventId: this.makeEventId(),
       participant: this.getMyParticipant(),
     });
 
-    // 4. Periodic Presence Heartbeat & Pruning (every 1.8 seconds)
+    // Periodic Presence Heartbeat & Pruning (every 2.2 seconds over external WS + BroadcastChannel)
     this.heartbeatTimer = window.setInterval(() => {
       if (this.destroyed) return;
       this.broadcastMyPresence();
       this.pruneStalePeers();
-    }, 1800);
+    }, 2200);
 
-    // 5. Fallback HTTP /api/room poll (every 1.5 seconds)
-    this.apiPollTimer = window.setInterval(() => {
-      if (this.destroyed) return;
-      this.pollApiRoom();
-    }, 1500);
-    this.pollApiRoom();
-
-    // Send leave notification when closing tab
     window.addEventListener('beforeunload', this.handleWindowUnload);
     window.addEventListener('pagehide', this.handleWindowUnload);
   }
@@ -296,16 +290,6 @@ export class RealtimeMesh {
         })
       );
     }
-
-    fetch('/api/room', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'voice_chunk',
-        roomId: SINGLE_ROOM_ID,
-        chunk: packet,
-      }),
-    }).catch(() => {});
   }
 
   public sendRoomMessage(message: RoomMessage) {
@@ -324,36 +308,24 @@ export class RealtimeMesh {
         })
       );
     }
-
-    fetch('/api/room', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'message',
-        roomId: SINGLE_ROOM_ID,
-        message,
-      }),
-    }).catch(() => {});
   }
 
   private publishMeshPacket(packet: MeshEventPacket) {
     this.seenEventIds.add(packet.eventId);
 
-    // Send over Same-Device BroadcastChannel
     try {
       this.broadcastChannel?.postMessage(packet);
     } catch {
       // Ignore
     }
 
-    // Send over Connected Cloud WebSocket MQTT Brokers
     const serialized = JSON.stringify(packet);
     for (const client of this.mqttClients) {
       if (client.connected) {
         try {
           client.publish(MESH_TOPIC, serialized, { qos: 0 });
         } catch {
-          // Ignore publish error
+          // Ignore
         }
       }
     }
@@ -364,7 +336,6 @@ export class RealtimeMesh {
     if (this.seenEventIds.has(packet.eventId)) return;
     this.seenEventIds.add(packet.eventId);
 
-    // Keep seenEventIds bounded
     if (this.seenEventIds.size > 600) {
       const first = this.seenEventIds.values().next().value;
       if (first) this.seenEventIds.delete(first);
@@ -383,7 +354,6 @@ export class RealtimeMesh {
         });
         this.emitParticipantsList();
 
-        // Reply immediately with our presence & message history so the new tab/friend sees us right away!
         if (p.id !== this.myPeerId) {
           this.publishMeshPacket({
             type: 'peer:presence',
@@ -482,43 +452,6 @@ export class RealtimeMesh {
     this.onParticipantsChanged(list);
   }
 
-  private async pollApiRoom() {
-    try {
-      const me = this.getMyParticipant();
-      const res = await fetch('/api/room', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'heartbeat',
-          roomId: SINGLE_ROOM_ID,
-          sinceSeq: this.latestApiSeq,
-          participant: me,
-        }),
-      });
-      if (res.ok) {
-        const snapshot = await res.json();
-        if (typeof snapshot.latestSeq === 'number' && snapshot.latestSeq > this.latestApiSeq) {
-          this.latestApiSeq = snapshot.latestSeq;
-        }
-        if (Array.isArray(snapshot.participants)) {
-          this.mergeServerParticipants(snapshot.participants);
-        }
-        if (Array.isArray(snapshot.voiceChunks)) {
-          for (const pkt of snapshot.voiceChunks as VoiceChunkPacket[]) {
-            this.onVoiceChunk(pkt);
-          }
-        }
-        if (Array.isArray(snapshot.messages)) {
-          for (const m of snapshot.messages as RoomMessage[]) {
-            this.onRoomMessage(m, false);
-          }
-        }
-      }
-    } catch {
-      // Ignore if offline
-    }
-  }
-
   public destroy() {
     this.destroyed = true;
     this.handleWindowUnload();
@@ -526,7 +459,6 @@ export class RealtimeMesh {
     window.removeEventListener('pagehide', this.handleWindowUnload);
 
     if (this.heartbeatTimer !== null) clearInterval(this.heartbeatTimer);
-    if (this.apiPollTimer !== null) clearInterval(this.apiPollTimer);
 
     try {
       this.broadcastChannel?.close();
